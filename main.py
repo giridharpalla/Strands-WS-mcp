@@ -1,56 +1,104 @@
-from fastapi import FastAPI, BackgroundTasks, HTTPException
-from pydantic import BaseModel
-import contextlib
-from scraper import scraper
+"""
+FastAPI REST API server for the Web Research Agent.
 
-@contextlib.asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Initialize the Playwright browser when the app starts
-    await scraper.initialize()
-    yield
-    # Clean up the browser when the app shuts down
-    await scraper.close()
+Endpoints:
+  POST /ask        - Ask a question (stateless, new agent per request)
+  POST /chat       - Chat with memory (session-based)
+  POST /scrape     - Directly scrape a URL
+  GET  /health     - Health check
+
+Run:  uvicorn main:app --reload --port 8000
+"""
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import Optional
+from agent import WebResearchAgent, scrape_url
 
 app = FastAPI(
-    title="Real-Time Dynamic Web Scraper API",
-    description="API to scrape JavaScript-rendered content using Playwright",
-    version="1.0.0",
-    lifespan=lifespan
+    title="DiscOverflow Web Research Agent API",
+    description="AI-powered web research agent using AWS Bedrock Llama 4 Maverick + Playwright",
+    version="1.0.0"
 )
+
+# --- Session store for chat mode ---
+_sessions: dict[str, WebResearchAgent] = {}
+
+
+# --- Request/Response models ---
+class AskRequest(BaseModel):
+    question: str
+
+class ChatRequest(BaseModel):
+    session_id: str
+    question: str
 
 class ScrapeRequest(BaseModel):
     url: str
 
-@app.get("/")
-def read_root():
-    return {"message": "Welcome to the Real-Time Dynamic Web Scraper API"}
+class AgentResponse(BaseModel):
+    answer: str
+    total_time: float
+    scrape_time: float
+    llm_time: float
 
-@app.post("/scrape")
-async def perform_scrape(request: ScrapeRequest):
-    data = await scraper.scrape(request.url)
-    
-    if data["status"] == "error":
-        raise HTTPException(status_code=500, detail=data["error"])
-        
-    return {"data": data}
+class ScrapeResponse(BaseModel):
+    url: str
+    content: str
+    chars: int
 
-@app.get("/scrape/discoverflow")
-async def scrape_discoverflow():
-    # Dedicated endpoint for the specific requested site
-    target_url = "https://discoverflow.co/"
-    data = await scraper.scrape(target_url)
-    
-    if data["status"] == "error":
-        raise HTTPException(status_code=500, detail=data["error"])
-        
-    return {"data": data}
 
-if __name__ == "__main__":
-    import uvicorn
-    import sys
-    import asyncio
-    
-    if sys.platform == "win32":
-        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-        
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
+# --- Endpoints ---
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "model": "us.meta.llama4-maverick-17b-instruct-v1:0"}
+
+
+@app.post("/ask", response_model=AgentResponse)
+def ask(req: AskRequest):
+    """Ask a one-shot question (no conversation memory)."""
+    agent = WebResearchAgent()
+    result = agent.ask(req.question)
+    return AgentResponse(
+        answer=result["answer"],
+        total_time=round(result["total_time"], 2),
+        scrape_time=round(result["scrape_time"], 2),
+        llm_time=round(result["llm_time"], 2)
+    )
+
+
+@app.post("/chat", response_model=AgentResponse)
+def chat(req: ChatRequest):
+    """Chat with conversation memory. Use the same session_id for follow-up questions."""
+    if req.session_id not in _sessions:
+        _sessions[req.session_id] = WebResearchAgent()
+
+    agent = _sessions[req.session_id]
+    result = agent.ask(req.question)
+    return AgentResponse(
+        answer=result["answer"],
+        total_time=round(result["total_time"], 2),
+        scrape_time=round(result["scrape_time"], 2),
+        llm_time=round(result["llm_time"], 2)
+    )
+
+
+@app.post("/chat/{session_id}/reset")
+def reset_chat(session_id: str):
+    """Reset a chat session's conversation history."""
+    if session_id in _sessions:
+        _sessions[session_id].reset()
+        return {"status": "reset", "session_id": session_id}
+    raise HTTPException(status_code=404, detail="Session not found")
+
+
+@app.post("/scrape", response_model=ScrapeResponse)
+def scrape(req: ScrapeRequest):
+    """Directly scrape a URL without AI analysis."""
+    content = scrape_url(req.url)
+    return ScrapeResponse(
+        url=req.url,
+        content=content,
+        chars=len(content)
+    )
