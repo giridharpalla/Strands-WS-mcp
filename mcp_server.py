@@ -100,40 +100,44 @@ async def scrape_website(url: str) -> str:
 
 # --- Pre-warm cache on startup ---
 
-PREWARM_URLS = [
-    "https://discoverflow.co/",
-    "https://discoverflow.co/barbados/",
-    "https://discoverflow.co/anguilla/",
-    "https://discoverflow.co/antigua/",
-    "https://discoverflow.co/bvi/",
-    "https://discoverflow.co/cayman/",
-    "https://discoverflow.co/grenada/",
-    "https://discoverflow.co/turks-and-caicos/",
-    "https://discoverflow.co/jamaica/",
-    "https://discoverflow.co/montserrat/",
-    "https://discoverflow.co/st-lucia/",
-    "https://discoverflow.co/dominica/",
-    "https://discoverflow.co/st-vincent/",
-    "https://discoverflow.co/trinidad/",
-    "https://discoverflow.co/st-kitts/"
+COUNTRIES = [
+    "jamaica", "barbados", "anguilla", "antigua", 
+    "british-virgin-islands", "cayman", "grenada", 
+    "turks-and-caicos", "montserrat", "saint-lucia", 
+    "dominica", "saint-vincent", "trinidad", "saint-kitts"
 ]
+
+PREWARM_URLS = ["https://discoverflow.co/"]
+for c in COUNTRIES:
+    PREWARM_URLS.append(f"https://discoverflow.co/{c}/")
+    PREWARM_URLS.append(f"https://discoverflow.co/{c}/mobile/plans/prepaid")
+    PREWARM_URLS.append(f"https://discoverflow.co/{c}/mobile/plans/postpaid")
+    PREWARM_URLS.append(f"https://discoverflow.co/{c}/internet-bundles")
 
 
 async def prewarm_cache():
     """Scrape common pages on startup so first user query hits cache."""
-    print("  Pre-warming cache...")
+    print(f"  Pre-warming cache for {len(PREWARM_URLS)} URLs...")
     scraper = await _get_scraper()
-    for url in PREWARM_URLS:
-        try:
-            print(f"    Caching {url}...", end=" ", flush=True)
-            data = await scraper.scrape(url)
-            if data["status"] == "success":
-                _cache[url] = (time.time(), data)
-                print(f"OK ({len(_format_data(data))} chars)")
-            else:
-                print(f"SKIP ({data.get('error', 'unknown error')})")
-        except Exception as e:
-            print(f"ERROR ({e})")
+    
+    # We will fetch 4 URLs concurrently to speed up startup drastically
+    sem = asyncio.Semaphore(4)
+    
+    async def fetch(url):
+        async with sem:
+            try:
+                # print(f"    Caching {url}...", end=" ", flush=True)
+                data = await scraper.scrape(url)
+                if data["status"] == "success":
+                    _cache[url] = (time.time(), data)
+                    print(f"    [OK] Cached {url} ({len(_format_data(data))} chars)")
+                else:
+                    print(f"    [SKIP] {url} ({data.get('error', 'unknown error')})")
+            except Exception as e:
+                print(f"    [ERROR] {url} ({e})")
+
+    # Run them all concurrently
+    await asyncio.gather(*(fetch(url) for url in PREWARM_URLS))    
     print(f"  Cache warm: {len(_cache)} URLs ready.\n")
 
 
