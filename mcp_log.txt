@@ -1,0 +1,43 @@
+﻿Starting DiscOverflow Scraper MCP Server...
+  Transport: SSE
+  Endpoint:  http://localhost:8080/sse
+  Browser will stay warm between requests.
+
+  Pre-warming cache...
+    Caching https://discoverflow.co/... OK (2222 chars)
+    Caching https://discoverflow.co/jamaica/... OK (10083 chars)
+    Caching https://discoverflow.co/jamaica/mobile/plans/postpaid... OK (12639 chars)
+    Caching https://discoverflow.co/jamaica/internet-bundles... OK (13715 chars)
+    Caching https://discoverflow.co/barbados/... OK (9253 chars)
+    Caching https://discoverflow.co/cayman/... OK (6780 chars)
+    Caching https://discoverflow.co/grenada/... OK (8298 chars)
+    Caching https://discoverflow.co/turks-and-caicos/... OK (10177 chars)
+    Caching https://discoverflow.co/st-lucia/... OK (1019 chars)
+    Caching https://discoverflow.co/dominica/... OK (8595 chars)
+    Caching https://discoverflow.co/st-vincent/... OK (1021 chars)
+    Caching https://discoverflow.co/st-kitts/... OK (1019 chars)
+python : INFO:     Started 
+server process [6880]
+At line:1 char:240
++ ... s 2; . 
+.\venv\Scripts\Activate.ps1; 
+python mcp_server.py 2>&1 | 
+Out-F ...
++                            
+             
+~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo           
+   : NotSpecified: (INFO:    
+     Started server proces   
+ s [6880]:String) [], Rem    
+oteException
+    + FullyQualifiedErrorId  
+   : NativeCommandError
+ 
+INFO:     Waiting for 
+application startup.
+INFO:     Application 
+startup complete.
+INFO:     Uvicorn running on 
+http://0.0.0.0:8080 (Press 
+CTRL+C to quit)

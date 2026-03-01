@@ -92,16 +92,13 @@ class DiscoverFlowScraper:
 
             title = await page.title()
 
-            # Use textContent (not innerText) — this captures ALL text
-            # including hidden carousel slides, off-screen items, etc.
-            full_text = await page.evaluate("""
-                () => {
-                    // Remove script/style tags from consideration
-                    const clone = document.body.cloneNode(true);
-                    clone.querySelectorAll('script, style, noscript').forEach(el => el.remove());
-                    return clone.textContent.replace(/\\s+/g, ' ').trim();
-                }
-            """)
+            html_content = await page.content()
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(html_content, 'html.parser')
+            # Remove scripts and styles
+            for elements in soup(["script", "style", "noscript"]):
+                elements.decompose()
+            full_text = soup.get_text(separator=' ', strip=True)
 
             # Extract ALL links
             links = await page.evaluate("""() => {

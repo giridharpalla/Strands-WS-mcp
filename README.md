@@ -1,17 +1,17 @@
 # DiscOverflow AI Web Research Agent
 
-An AI-powered web research agent that scrapes dynamic, JavaScript-rendered content from [discoverflow.co](https://discoverflow.co/) in real-time using a **Playwright headless browser** and answers questions using **AWS Bedrock Llama 4 Maverick** (`meta.llama4-maverick-17b-instruct-v1:0`).
+An AI-powered web research agent that scrapes dynamic, JavaScript-rendered content from [discoverflow.co](https://discoverflow.co/) in real-time using a **Playwright headless browser** via **MCP** and answers questions using **OpenAI API** (`gpt-4o-mini`) orchestrated by **Strands Agents**.
 
 ---
 
 ## Features
 
 - **Real-Time Dynamic Scraping** -- Playwright headless browser renders JavaScript-heavy pages and extracts all content
-- **AI-Powered Analysis** -- Llama 4 Maverick on AWS Bedrock analyzes scraped content and provides detailed answers
-- **Interactive Chat Mode** -- Multi-turn conversational interface with context memory
-- **REST API Server** -- FastAPI endpoints for programmatic access (ready for TTS, web UI, etc.)
-- **Native Tool Calling** -- AWS Bedrock Converse API with native tool use for automatic scraper invocation
-- **URL Caching** -- Avoids re-scraping the same page within 5 minutes
+- **AI-Powered Analysis** -- OpenAI API (gpt-4o-mini) evaluates scraped content and provides detailed answers
+- **Interactive Chat Mode** -- Multi-turn conversational interface with streaming real-time output
+- **REST API Server** -- FastAPI endpoints for programmatic access
+- **MCP Server** -- Model Context Protocol server keeps browser warm for fast scraping
+- **Strands Agents Integration** -- Robust agent state management and asynchronous streaming with native MCP tool calling
 - **Latency Tracking** -- Per-question breakdown of scraping vs LLM inference time
 
 ---
@@ -27,17 +27,15 @@ graph TB
     end
 
     subgraph "Core Agent"
-        AGENT["WebResearchAgent<br/>(agent.py)"]
-        CACHE["URL Cache<br/>5-min TTL"]
+        AGENT["WebResearchAgent<br/>(Strands Agents)"]
     end
 
-    subgraph "AWS Bedrock"
-        LLM["Llama 4 Maverick 17B<br/>Converse API"]
+    subgraph "OpenAI API"
+        LLM["gpt-4o-mini<br/>(Streaming)"]
     end
 
-    subgraph "Web Scraper"
-        SCRAPER["DiscoverFlowScraper<br/>(scraper.py)"]
-        BROWSER["Playwright<br/>Headless Chromium"]
+    subgraph "Scraping"
+        MCPS["MCP Server<br/>(mcp_server.py)<br/>Warm Browser"]
     end
 
     subgraph "Target"
@@ -48,11 +46,8 @@ graph TB
     API --> AGENT
     ONE --> AGENT
     AGENT <--> LLM
-    AGENT --> CACHE
-    CACHE -->|cache miss| SCRAPER
-    CACHE -->|cache hit| AGENT
-    SCRAPER --> BROWSER
-    BROWSER --> WEB
+    AGENT <--> MCPS
+    MCPS --> WEB
 ```
 
 ---
@@ -65,46 +60,30 @@ This is the complete flow from when a user asks a question to when they receive 
 sequenceDiagram
     actor User
     participant Chat as chat.py / main.py
-    participant Agent as WebResearchAgent
-    participant Bedrock as AWS Bedrock<br/>Llama 4 Maverick
-    participant Cache as URL Cache
-    participant Scraper as Playwright Scraper
+    participant Agent as WebResearchAgent<br/>(Strands)
+    participant Model as OpenAI API<br/>gpt-4o-mini
+    participant Scraper as MCP Server / Playwright
     participant Web as discoverflow.co
 
     User->>Chat: "What postpaid plans are in St Maarten?"
-    Chat->>Agent: agent.ask(question)
-    Agent->>Bedrock: Converse API call<br/>(user message + tool definition)
+    Chat->>Agent: agent.ask_stream(question)
+    Agent->>Model: Streaming Inference<br/>(user messages + MCP tools)
     
-    Note over Bedrock: LLM decides it needs<br/>to scrape a website
+    Note over Model: LLM decides it needs<br/>to scrape a website
 
-    Bedrock-->>Agent: tool_use: scrape_website<br/>url: discoverflow.co/.../postpaid
+    Model-->>Agent: tool_use: scrape_website<br/>url: discoverflow.co/.../postpaid
     
-    Agent->>Cache: Check URL cache
+    Agent->>Scraper: call_tool: scrape_website
+    Scraper->>Web: Navigate to URL
+    Note over Scraper,Web: 1. Load page & wait for JS render<br/>2. Dismiss cookie banners<br/>3. Scroll full page for lazy content<br/>4. Extract all text, headings, cards, links
+    Web-->>Scraper: Rendered HTML content
+    Scraper-->>Agent: Tool result with scraped content
     
-    alt Cache Hit (within 5 min)
-        Cache-->>Agent: Return cached content
-    else Cache Miss
-        Agent->>Scraper: scrape(url)
-        Scraper->>Web: Navigate to URL
-        Note over Scraper,Web: 1. Load page & wait for JS render<br/>2. Dismiss cookie banners<br/>3. Scroll full page for lazy content<br/>4. Click carousel arrows<br/>5. Extract all text, headings, cards, links
-        Web-->>Scraper: Rendered HTML content
-        Scraper-->>Agent: Structured data<br/>(title, headings, blocks, links, text)
-        Agent->>Cache: Store in cache
-    end
+    Note over Model: LLM reads scraped data<br/>and yields final answer tokens
 
-    Agent->>Bedrock: Tool result with scraped content
-    
-    Note over Bedrock: LLM reads scraped data<br/>and formulates answer
-
-    alt Need more info
-        Bedrock-->>Agent: Another tool_use call<br/>(different URL)
-        Note over Agent,Web: Repeat scrape cycle...
-        Agent->>Bedrock: Additional tool results
-    end
-
-    Bedrock-->>Agent: Final text answer with<br/>specific plans, prices, details
-    Agent-->>Chat: {answer, total_time, scrape_time, llm_time}
-    Chat-->>User: Display answer + latency breakdown
+    Model-->>Agent: Stream text deltas...
+    Agent-->>Chat: Yield real-time text chunks
+    Chat-->>User: Display answer word-by-word
 ```
 
 ---
@@ -149,11 +128,11 @@ How the LLM decides when to use the scraper tool:
 
 ```mermaid
 flowchart TD
-    A["User asks question"] --> B["Send to Bedrock<br/>Converse API"]
+    A["User asks question"] --> B["Send to OpenAI API<br/>(Streaming)"]
     B --> C{"LLM stop_reason?"}
     
     C -->|tool_use| D["LLM wants to scrape<br/>a website URL"]
-    D --> E["Execute Playwright<br/>scraper on URL"]
+    D --> E["Execute Playwright<br/>scraper on URL via MCP"]
     E --> F["Send scraped data<br/>back to LLM"]
     F --> B
     
@@ -173,22 +152,26 @@ flowchart TD
 ```
 swp/
   agent.py          # WebResearchAgent class (core logic)
-                    #   - Bedrock Converse API integration
-                    #   - Tool call handling
-                    #   - URL caching
-                    #   - Scraper output formatting
+                    #   - Strands Agents integration
+                    #   - OpenAI streaming support
+                    #   - MCPClient setup and event hooks
+                    #   - Scraper SDK interfacing
                     #   - Also runs as one-shot CLI
 
   chat.py           # Interactive chat CLI
                     #   - Imports WebResearchAgent from agent.py
                     #   - Multi-turn conversation loop
-                    #   - Latency display
+                    #   - Latency display and streaming output
 
   main.py           # FastAPI REST API server
                     #   - POST /ask     (stateless question)
                     #   - POST /chat    (session-based chat)
-                    #   - POST /scrape  (direct URL scraping)
+                    #   - POST /scrape  (direct URL scraping via MCP)
                     #   - GET  /health  (health check)
+
+  mcp_server.py     # MCP Server for warm-browser scraping
+                    #   - Persistent Playwright browser
+                    #   - SSE transport on port 8080
 
   scraper.py        # Playwright headless browser scraper
                     #   - Cookie banner dismissal
@@ -236,8 +219,7 @@ curl -X POST http://localhost:8000/ask \
 ### Prerequisites
 
 - **Python 3.10+**
-- **AWS Account** with Bedrock access for Meta Llama 4 Maverick
-- **AWS CLI** configured (`aws configure`)
+- **OpenAI API Key** (`OPENAI_API_KEY` environment variable configured with a valid testing key)
 
 ### Installation
 
@@ -260,33 +242,32 @@ pip install -r requirements.txt
 
 # Install Playwright browsers
 playwright install chromium
-
-# Configure AWS (if not done)
-aws configure
 ```
-
-### AWS Bedrock Model Access
-
-1. Go to AWS Console > Amazon Bedrock > Model Access
-2. Request access for **Meta Llama 4 Maverick 17B Instruct**
-3. Ensure region is set to **us-east-1**
 
 ---
 
 ## Running
 
-### Interactive Chat
+### Interactive Chat (MCP Mode - Warm Browser)
 ```bash
+# Terminal 1: Start the MCP server (keeps browser warm)
+python mcp_server.py
+
+# Terminal 2: Start the chat connected to MCP server
+set OPENAI_API_KEY=sk-...
+set MCP_SERVER_URL=http://localhost:8080/sse
 python chat.py
 ```
 
 ### One-Shot Agent
 ```bash
+set OPENAI_API_KEY=sk-...
 python agent.py
 ```
 
 ### REST API Server
 ```bash
+set OPENAI_API_KEY=sk-...
 uvicorn main:app --reload --port 8000
 # Then visit http://localhost:8000/docs for Swagger UI
 ```
@@ -297,45 +278,26 @@ uvicorn main:app --reload --port 8000
 
 ```
 ============================================================
-  DiscOverflow Chat - Powered by Llama 4 Maverick
+  DiscOverflow Chat - Powered by gpt-4o-mini
+  Scraper: MCP Server (http://localhost:8080/sse)
+  Streaming: ON (real-time word-by-word output)
   Ask me anything about discoverflow.co!
   Type 'quit' or 'exit' to stop.
 ============================================================
 
 You: what postpaid plans are in st maarten?
+
   [Scraping https://discoverflow.co/en/web/st-maarten/mobile/plans/postpaid...]
   [Done - 11835 chars]
-
+  
 A: The postpaid plans available in St. Maarten are:
 
   * $15/month: 2GB data, 50 minutes, 20 messages
   * $25/month: 3GB data, 70 minutes, 50 messages
-  * $35/month: 3.5GB data, 100 minutes, 100 messages
-  * $55/month: 5GB data, 160 minutes, 150 messages
-  * $80/month: 7GB data, 240 minutes, 200 messages
-  * $100/month: 9GB data, 350 minutes, 200 messages
-  * $135/month: 12GB data, 400 minutes, 200 messages
-  * $249/month: 20GB data, 1000 minutes, 200 messages
-
-  Add-ons available via SMS to 5454:
-  * Data: 1.5GB/$5, 3GB/$8, 6GB/$14
-  * Minutes & Messages: 60min+30msg/$12, 160min+40msg/$29, 300min+50msg/$55
+  ...
 
   [Latency: total=18.5s | scraping=15.2s | LLM=3.3s]
 ```
-
----
-
-## Latency Breakdown
-
-| Component | Typical Time | Notes |
-|-----------|-------------|-------|
-| Playwright page load | 5-8s | Depends on target site speed |
-| JS render wait | 3s | Allows dynamic content to load |
-| Page scroll + carousel | 2-4s | Triggers lazy-loaded content |
-| Content extraction | <0.5s | DOM parsing |
-| LLM inference | 2-4s | Bedrock Converse API |
-| **Cache hit** | **<0.1s** | Same URL within 5 minutes |
 
 ---
 
@@ -343,8 +305,9 @@ A: The postpaid plans available in St. Maarten are:
 
 | Component | Technology |
 |-----------|-----------|
-| LLM | AWS Bedrock - Meta Llama 4 Maverick 17B |
+| LLM API | OpenAI API (gpt-4o-mini) |
+| Framework | Strands Agents |
 | Web Scraping | Playwright (headless Chromium) |
-| API Framework | FastAPI + Uvicorn |
-| AWS SDK | boto3 |
+| Tool Protocol | MCP (Model Context Protocol) |
+| API Layer | FastAPI + Uvicorn |
 | Language | Python 3.10+ |

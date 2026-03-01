@@ -1,305 +1,272 @@
-"""
-Reusable Web Research Agent powered by AWS Bedrock Llama 4 Maverick + Playwright.
-
-This module provides the core WebResearchAgent class used by:
-  - chat.py  (interactive CLI)
-  - main.py  (FastAPI REST API)
-"""
-
-import json
-import asyncio
+import os
 import sys
 import time
-import boto3
-from scraper import DiscoverFlowScraper
+import asyncio
+import queue
+import threading
+
+from strands import Agent
+from strands.models.openai import OpenAIModel
+from strands.tools.mcp import MCPClient
+from strands.handlers.callback_handler import null_callback_handler
+from strands.hooks.events import BeforeToolCallEvent, AfterToolCallEvent
+from mcp.client.sse import sse_client
 
 # --- Configuration ---
-MODEL_ID = "us.meta.llama4-maverick-17b-instruct-v1:0"
-REGION = "us-east-1"
+MODEL_ID = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+MCP_SERVER_URL = os.environ.get("MCP_SERVER_URL", "http://localhost:8080/sse")
 
-# --- Bedrock Tool Schema ---
-TOOL_CONFIG = {
-    "tools": [
-        {
-            "toolSpec": {
-                "name": "scrape_website",
-                "description": (
-                    "Scrapes a dynamic JavaScript-rendered website using a headless browser. "
-                    "Returns the page title, headings, all structured content blocks (like cards, "
-                    "plans, products, services), links, and the full page text. "
-                    "Use this tool whenever the user asks about any website content."
-                ),
-                "inputSchema": {
-                    "json": {
-                        "type": "object",
-                        "properties": {
-                            "url": {
-                                "type": "string",
-                                "description": "The URL to scrape, e.g. https://discoverflow.co/"
-                            }
-                        },
-                        "required": ["url"]
-                    }
-                }
-            }
-        }
-    ]
-}
+SYSTEM_PROMPT = (
+    "You are a knowledgeable web research assistant powered by a real-time web scraper. "
+    "You have access to a scrape_website tool that fetches live content from any website "
+    "using a headless browser.\n\n"
+    "STRICT RULES:\n"
+    "1. When the user asks about website content, ALWAYS use the scrape tool first.\n"
+    "2. Answer ONLY based on actual scraped data. Never guess or make up information.\n"
+    "3. The scraped data contains: HEADINGS, PAGE CONTENT BLOCKS (most important - "
+    "contains plans, prices, products, cards, features), LINKS, and FULL PAGE TEXT. "
+    "Read ALL sections carefully before answering.\n"
+    "4. Give SPECIFIC details (prices, data amounts, features, names). Be thorough.\n"
+    "5. NEVER tell the user to 'visit', 'check', or 'try' a URL themselves. "
+    "YOU have the scraper tool. If you need more info from a different page, "
+    "call the scrape_website tool again with that URL. You can call the tool "
+    "multiple times in one response.\n"
+    "6. If the first page you scrape doesn't have enough detail, look at the LINKS "
+    "section to find a more specific page and scrape THAT page too. Keep scraping "
+    "until you have a complete answer.\n"
+    "7. The default website is https://discoverflow.co/. If the user asks about a specific country, "
+    "FIRST scrape the country's main page (e.g., https://discoverflow.co/trinidad/, "
+    "https://discoverflow.co/jamaica/, https://discoverflow.co/web/st-maarten/). "
+    "THEN look at the 'LINKS' section in the scraped result to find the exact URL for "
+    "mobile plans, internet, or bundles, and scrape that second URL. Do NOT guess the "
+    "URL structures recursively, as different countries have different available services "
+    "(e.g. Trinidad has '/internet' and '/bundles/overview', but no mobile plans).\n"
+    "8. Your answers must be COMPLETE and SELF-CONTAINED. The user must get the full "
+    "answer from you without needing to do anything else.\n"
+    "9. CRITICAL ANTI-LOOP RULE: Do NOT scrape the exact same URL more than once in a single message. "
+    "If you scrape a URL and it does not contain the information you need, do NOT scrape it again. \n"
+    "10. If you have scraped 3 different pages and still cannot find the specific plans or prices requested, "
+    "STOP scraping and inform the user that the specific details are currently unavailable on the website."
+)
 
-SYSTEM_PROMPT = [
-    {
-        "text": (
-            "You are a knowledgeable web research assistant powered by a real-time web scraper. "
-            "You have access to a scrape_website tool that fetches live content from any website "
-            "using a headless browser.\n\n"
-            "STRICT RULES:\n"
-            "1. When the user asks about website content, ALWAYS use the scrape tool first.\n"
-            "2. Answer ONLY based on actual scraped data. Never guess or make up information.\n"
-            "3. The scraped data contains: HEADINGS, PAGE CONTENT BLOCKS (most important - "
-            "contains plans, prices, products, cards, features), LINKS, and FULL PAGE TEXT. "
-            "Read ALL sections carefully before answering.\n"
-            "4. Give SPECIFIC details (prices, data amounts, features, names). Be thorough.\n"
-            "5. NEVER tell the user to 'visit', 'check', or 'try' a URL themselves. "
-            "YOU have the scraper tool. If you need more info from a different page, "
-            "call the scrape_website tool again with that URL. You can call the tool "
-            "multiple times in one response.\n"
-            "6. If the first page you scrape doesn't have enough detail, look at the LINKS "
-            "section to find a more specific page and scrape THAT page too. Keep scraping "
-            "until you have a complete answer.\n"
-            "7. The default website is https://discoverflow.co/. For country-specific pages, "
-            "construct URLs like:\n"
-            "   - https://discoverflow.co/en/web/st-maarten/mobile/plans/postpaid\n"
-            "   - https://discoverflow.co/jamaica/mobile/plans/prepaid\n"
-            "   - https://discoverflow.co/en/web/barbados/internet\n"
-            "   - https://discoverflow.co/jamaica/internet-bundles\n"
-            "8. Your answers must be COMPLETE and SELF-CONTAINED. The user must get the full "
-            "answer from you without needing to do anything else."
-        )
-    }
-]
-
-
-# ─── URL Cache ───────────────────────────────────────────────────
-_url_cache = {}
-_cache_ttl = 300  # 5 minutes
-
-
-def _format_scraped_data(data: dict) -> str:
-    """Format raw scraper output into a structured string for the LLM."""
-    if data["status"] == "error":
-        return f"Error scraping: {data.get('error')}"
-
-    result = f"URL: {data.get('url')}\nTitle: {data.get('title', 'N/A')}\n\n"
-
-    result += "=== HEADINGS ===\n"
-    for h in data.get("headings", {}).get("h1", []):
-        result += f"  H1: {h}\n"
-    for h in data.get("headings", {}).get("h2", []):
-        result += f"  H2: {h}\n"
-    for h in data.get("headings", {}).get("h3", []):
-        result += f"  H3: {h}\n"
-
-    blocks = data.get("structured_blocks", [])
-    if blocks:
-        result += "\n=== PAGE CONTENT BLOCKS (cards, plans, services, etc.) ===\n"
-        for i, block in enumerate(blocks, 1):
-            result += f"\n[Block {i}]\n{block}\n"
-
-    result += "\n=== LINKS ===\n"
-    for link in data.get("links", [])[:25]:
-        text = link.get("text", "").strip()
-        href = link.get("href", "").strip()
-        if text and href:
-            result += f"  - {text}: {href}\n"
-
-    result += "\n=== FULL PAGE TEXT ===\n"
-    result += data.get("body_text", "")[:8000]
-
-    return result
-
-
-def scrape_url(url: str) -> str:
-    """Scrape a URL and return formatted text. Uses a cache to avoid duplicate scrapes."""
-    if url in _url_cache:
-        cached_time, cached_result = _url_cache[url]
-        if time.time() - cached_time < _cache_ttl:
-            return cached_result
-
-    if sys.platform == "win32":
-        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-
-    async def _run():
-        s = DiscoverFlowScraper()
-        await s.initialize()
-        try:
-            return await s.scrape(url)
-        finally:
-            await s.close()
-
-    data = asyncio.run(_run())
-    formatted = _format_scraped_data(data)
-    _url_cache[url] = (time.time(), formatted)
-    return formatted
-
-
-# ─── Web Research Agent ──────────────────────────────────────────
+# if sys.platform == "win32":
+#     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 class WebResearchAgent:
     """
-    Stateful agent that uses AWS Bedrock Llama 4 Maverick + Playwright scraper.
-    Maintains conversation history for multi-turn chats.
+    Stateful agent using Strands Agents + OpenAI + MCP.
+    Supports both non-streaming (.ask) and streaming (.ask_stream) modes.
     """
 
-    def __init__(self, model_id=MODEL_ID, region=REGION):
-        self.client = boto3.client("bedrock-runtime", region_name=region)
-        self.model_id = model_id
-        self.messages = []
+    def __init__(self, model_id=None):
+        self.model_id = model_id or MODEL_ID
+        self.model = OpenAIModel(model_id=self.model_id)
 
-    def _handle_tool_calls(self, assistant_content):
-        """Execute tool calls and return results with timing info."""
-        tool_results = []
-        total_scrape_time = 0.0
+        self.tools = []
+        self.mcp_client = None
+        if MCP_SERVER_URL:
+            # MCP Client expects a callable that returns an async context manager
+            # sse_client satisfies this contract.
+            self.mcp_client = MCPClient(lambda: sse_client(MCP_SERVER_URL))
+            self.tools.append(self.mcp_client)
 
-        for block in assistant_content:
-            if "toolUse" in block:
-                tool_use = block["toolUse"]
-                tool_id = tool_use["toolUseId"]
-                url = tool_use["input"].get("url", "https://discoverflow.co/")
+        self.agent = Agent(
+            model=self.model,
+            tools=self.tools,
+            system_prompt=SYSTEM_PROMPT,
+            callback_handler=null_callback_handler
+        )
 
-                try:
-                    scrape_start = time.time()
-                    result_text = scrape_url(url)
-                    elapsed = time.time() - scrape_start
-                    total_scrape_time += elapsed
+        self.total_scrape_time = 0.0
+        self._scrape_start_time = 0.0
+        self._current_url = ""
+        self._on_scrape = None
+        self._streaming_events = queue.Queue()
 
-                    tool_results.append({
-                        "toolResult": {
-                            "toolUseId": tool_id,
-                            "content": [{"text": result_text}]
-                        }
-                    })
-                except Exception as e:
-                    tool_results.append({
-                        "toolResult": {
-                            "toolUseId": tool_id,
-                            "content": [{"text": f"Error: {str(e)}"}],
-                            "status": "error"
-                        }
-                    })
+        # Add hooks to measure latencies
+        self.agent.add_hook(self.on_before_tool, BeforeToolCallEvent)
+        self.agent.add_hook(self.on_after_tool, AfterToolCallEvent)
 
-        return tool_results, total_scrape_time
+    def on_before_tool(self, event: BeforeToolCallEvent):
+        self._scrape_start_time = time.time()
+        self._current_url = event.tool_use.get("input", {}).get("url", "unknown url")
+        if self._on_scrape:
+            self._on_scrape(self._current_url, "start", 0)
+        self._streaming_events.put({"type": "scrape_start", "url": self._current_url})
 
-    def ask(self, question: str, on_scrape=None) -> dict:
-        """
-        Send a question to the agent and get a response.
-
-        Args:
-            question: The user's question
-            on_scrape: Optional callback(url, chars, seconds) for scrape events
-
-        Returns:
-            dict with keys: answer, total_time, scrape_time, llm_time
-        """
-        self.messages.append({
-            "role": "user",
-            "content": [{"text": question}]
-        })
-
-        start_time = time.time()
-        total_scrape_time = 0.0
-        total_llm_time = 0.0
-
-        max_turns = 5
-        for turn in range(max_turns):
-            try:
-                llm_start = time.time()
-                response = self.client.converse(
-                    modelId=self.model_id,
-                    messages=self.messages,
-                    system=SYSTEM_PROMPT,
-                    toolConfig=TOOL_CONFIG,
-                    inferenceConfig={"temperature": 0.1, "maxTokens": 4096}
-                )
-                total_llm_time += time.time() - llm_start
-            except Exception as e:
-                self.messages.pop()
-                return {
-                    "answer": f"API Error: {str(e)}",
-                    "total_time": time.time() - start_time,
-                    "scrape_time": total_scrape_time,
-                    "llm_time": total_llm_time
-                }
-
-            stop_reason = response["stopReason"]
-            output_message = response["output"]["message"]
-            assistant_content = output_message["content"]
-            self.messages.append(output_message)
-
-            if stop_reason == "tool_use":
-                # Execute scraper tool calls
-                for block in assistant_content:
-                    if "toolUse" in block:
-                        url = block["toolUse"]["input"].get("url", "")
-                        if on_scrape:
-                            on_scrape(url, "start", 0)
-
-                tool_results, scrape_elapsed = self._handle_tool_calls(assistant_content)
-                total_scrape_time += scrape_elapsed
-
-                # Report scrape completion
-                for block in assistant_content:
-                    if "toolUse" in block:
-                        url = block["toolUse"]["input"].get("url", "")
-                        cached = _url_cache.get(url)
-                        chars = len(cached[1]) if cached else 0
-                        if on_scrape:
-                            on_scrape(url, "done", chars)
-
-                self.messages.append({
-                    "role": "user",
-                    "content": tool_results
-                })
-
-            elif stop_reason == "end_turn":
-                answer = ""
-                for block in assistant_content:
-                    if "text" in block:
-                        answer += block["text"]
-
-                return {
-                    "answer": answer,
-                    "total_time": time.time() - start_time,
-                    "scrape_time": total_scrape_time,
-                    "llm_time": total_llm_time
-                }
-            else:
-                answer = ""
-                for block in assistant_content:
-                    if "text" in block:
-                        answer += block["text"]
-                return {
-                    "answer": answer or f"Unexpected stop: {stop_reason}",
-                    "total_time": time.time() - start_time,
-                    "scrape_time": total_scrape_time,
-                    "llm_time": total_llm_time
-                }
-
-        return {
-            "answer": "Max tool-call turns reached without a final answer.",
-            "total_time": time.time() - start_time,
-            "scrape_time": total_scrape_time,
-            "llm_time": total_llm_time
-        }
+    def on_after_tool(self, event: AfterToolCallEvent):
+        elapsed = 0.0
+        if self._scrape_start_time > 0:
+            elapsed = time.time() - self._scrape_start_time
+            self.total_scrape_time += elapsed
+            self._scrape_start_time = 0.0
+            
+        chars = 0
+        if event.result and "content" in event.result:
+            for item in event.result["content"]:
+                if "text" in item:
+                    chars += len(item["text"])
+        
+        if self._on_scrape:
+            self._on_scrape(self._current_url, "done", chars)
+        self._streaming_events.put({"type": "scrape_done", "url": self._current_url, "chars": chars})
 
     def reset(self):
         """Clear conversation history."""
-        self.messages = []
+        self.agent.messages.clear()
+
+    def ask(self, question: str, on_scrape=None) -> dict:
+        """Non-streaming query. Returns full answer at once."""
+        self.total_scrape_time = 0.0
+        self._on_scrape = on_scrape
+        with self._streaming_events.mutex:
+            self._streaming_events.queue.clear()
+        
+        start_time = time.time()
+        try:
+            # First, check if there's already an active event loop.
+            # If so, run the async function in it directly. Otherwise, use asyncio.run
+            try:
+                loop = asyncio.get_running_loop()
+                result = loop.run_until_complete(self.agent.invoke_async(question))
+            except RuntimeError:
+                result = asyncio.run(self.agent.invoke_async(question))
+        except Exception as e:
+            total_time = time.time() - start_time
+            llm_time = total_time - self.total_scrape_time
+            return {
+                "answer": f"API Error: {str(e)}",
+                "total_time": total_time,
+                "scrape_time": self.total_scrape_time,
+                "llm_time": llm_time
+            }
+
+        total_time = time.time() - start_time
+        llm_time = max(0, total_time - self.total_scrape_time)
+        
+        # Get final text out of agent messages
+        answer = ""
+        if result and hasattr(result, "message") and result.message:
+            for item in result.message.get("content", []):
+                if hasattr(item, "text"):
+                    answer += item.text
+                elif isinstance(item, dict) and "text" in item:
+                    answer += item["text"]
+                    
+        return {
+            "answer": answer,
+            "total_time": total_time,
+            "scrape_time": self.total_scrape_time,
+            "llm_time": llm_time
+        }
+
+    def ask_stream(self, question: str):
+        """Streaming query utilizing a background thread to bridge async callbacks."""
+        self.total_scrape_time = 0.0
+        self._on_scrape = None
+        with self._streaming_events.mutex:
+            self._streaming_events.queue.clear()
+        
+        start_time = time.time()
+        q = queue.Queue()
+        done_marker = object()
+
+        def background_stream():
+            try:
+                # Setup proper event loop for this thread to run strands Agents
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                
+                async def runner():
+                    async for evt in self.agent.stream_async(question):
+                        q.put(evt)
+                
+                loop.run_until_complete(runner())
+            except Exception as e:
+                q.put({"type": "error", "message": str(e)})
+            finally:
+                q.put(done_marker)
+                try:
+                    loop.run_until_complete(loop.shutdown_asyncgens())
+                except Exception:
+                    pass
+                loop.close()
+
+        t = threading.Thread(target=background_stream, daemon=True)
+        t.start()
+
+        while True:
+            # Drain any hook events first
+            while not self._streaming_events.empty():
+                yield self._streaming_events.get()
+
+            # Wait for next token/event with timeout so we can still flush hook events periodically
+            try:
+                evt = q.get(timeout=0.1)
+                if evt is done_marker:
+                    break
+                
+                if isinstance(evt, dict):
+                    if evt.get("type") == "error":
+                        yield evt
+                    else:
+                        text = evt.get("data", "")
+                        if text:
+                            yield {"type": "text", "token": text}
+            except queue.Empty:
+                pass 
+
+        # Final drain of hook events
+        while not self._streaming_events.empty():
+            yield self._streaming_events.get()
+
+        t.join()
+        total_time = time.time() - start_time
+        llm_time = max(0, total_time - self.total_scrape_time)
+        yield {
+            "type": "done",
+            "total_time": total_time,
+            "scrape_time": self.total_scrape_time,
+            "llm_time": llm_time
+        }
+
+    def cleanup(self):
+        """Explicitly cleanup resources, especially the MCP client event loop."""
+        if hasattr(self.agent, "cleanup"):
+            try:
+                self.agent.cleanup()
+            except Exception:
+                pass
+
+def scrape_url(url: str) -> str:
+    """Standalone fallback for main.py /scrape endpoint."""
+    if not MCP_SERVER_URL:
+        return "MCP_SERVER_URL not set."
+        
+    from mcp import ClientSession
+    from mcp.client.sse import sse_client
+    
+    async def _run():
+        async with sse_client(MCP_SERVER_URL) as (read_stream, write_stream):
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+                result = await session.call_tool("scrape_website", {"url": url})
+                text_parts = []
+                for content in result.content:
+                    if hasattr(content, "text"):
+                        text_parts.append(content.text)
+                return "\n".join(text_parts)
+                
+    return asyncio.run(_run())
 
 
 # ─── One-shot mode ───────────────────────────────────────────────
 if __name__ == "__main__":
     print("Starting one-shot agent...\n")
-    agent = WebResearchAgent()
+    print(f"  Model: {MODEL_ID}")
+    print(f"  Scraper mode: {'MCP (' + MCP_SERVER_URL + ')' if MCP_SERVER_URL else 'Error - MCP_SERVER_URL not set'}\n")
+
+    agent_instance = WebResearchAgent()
 
     def log_scrape(url, status, chars):
         if status == "start":
@@ -307,7 +274,7 @@ if __name__ == "__main__":
         else:
             print(f"  [Done - {chars} chars]")
 
-    result = agent.ask(
+    result = agent_instance.ask(
         "Scrape https://discoverflow.co/ and provide a detailed summary of the website's "
         "main offerings, services, and available countries.",
         on_scrape=log_scrape
@@ -316,5 +283,12 @@ if __name__ == "__main__":
     print(f"\n{'=' * 60}")
     print("RESULT")
     print(f"{'=' * 60}\n")
-    print(result["answer"])
-    print(f"\n[Latency: total={result['total_time']:.1f}s | scraping={result['scrape_time']:.1f}s | LLM={result['llm_time']:.1f}s]")
+    print(result.get("answer", "No answer"))
+    print(f"\n[Latency: total={result.get('total_time', 0):.1f}s | scraping={result.get('scrape_time', 0):.1f}s | LLM={result.get('llm_time', 0):.1f}s]")
+
+    # Clean up agent resources to avoid GC shutdown exceptions
+    try:
+        agent_instance.cleanup()
+    except Exception:
+        pass
+
